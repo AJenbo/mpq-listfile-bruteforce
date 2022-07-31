@@ -2,6 +2,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -79,8 +80,8 @@ constexpr uint32_t CRACK1 = 0xB29FC135;
 constexpr uint32_t CRACK2 = 0x22575C4A;
 
 // LEVELS\\L1DATA\\SKNGDO.DUN, 14 sec on ryzen 3700x
-//constexpr uint32_t CRACK1 = 0x3CC2BEC6;
-//constexpr uint32_t CRACK2 = 0xC2F426EA;
+// constexpr uint32_t CRACK1 = 0x3CC2BEC6;
+// constexpr uint32_t CRACK2 = 0xC2F426EA;
 
 // Sorted, contiguous up to Z (90), underscore is 95.
 // todo take as arg
@@ -99,19 +100,27 @@ void save(std::string_view result)
 	myfile.close();
 }
 
-bool nextString(char *str, size_t len)
+void initString(char *str, size_t len, uint64_t iter)
+{
+	for (size_t i = len; i > 0; --i) {
+		str[i - 1] = letters[iter % letters.size()];
+		iter /= letters.size();
+	}
+}
+
+void nextString(char *str, size_t len)
 {
 	for (size_t i = 0; i < len; ++i) {
 		if (str[i] != letters.back()) {
 			memset(str, letters.front(), i);
 			str[i] = nextLetter[static_cast<unsigned char>(str[i])];
-			return true;
+			return;
 		}
 	}
-	return false;
 }
 
 std::stop_source stop_source;
+std::mutex stdout_mutex;
 
 void match(std::string_view str)
 {
@@ -136,17 +145,39 @@ int main(int argc, char *argv[])
 		std::vector<std::jthread> threads;
 		constexpr unsigned MinLevel = 1;
 		constexpr unsigned MaxLevel = 8;
-		std::cout << "Trying levels from " << MinLevel << " to " << MaxLevel << "...\n";
+		constexpr unsigned NumChunks = 8;
+		std::cout << "Trying levels from " << MinLevel << " to " << MaxLevel << " in " << NumChunks << "chunks...\n";
+		uint64_t totalIters = 1;
 		for (unsigned level = MinLevel; level <= MaxLevel; level++) {
-			threads.emplace_back([level, stop_token = stop_source.get_token()]() {
-				constexpr std::string_view Suffix = ".DUN";
-				std::array<char, 16> strBuf;
-				memset(strBuf.data(), letters.front(), level);
-				memcpy(strBuf.data() + level, Suffix.data(), Suffix.length());
-				while (!stop_token.stop_requested() && nextString(strBuf.data(), level)) {
-					match(std::string_view(strBuf.data(), level + Suffix.length()));
-				}
-			});
+			totalIters *= letters.size();
+			for (unsigned chunk = 0; chunk < NumChunks; ++chunk) {
+				threads.emplace_back([totalIters, level, chunk, stop_token = stop_source.get_token()]() {
+					constexpr std::string_view Suffix = ".DUN";
+					std::array<char, 16> strBuf;
+
+					const size_t chunkBegin = totalIters * chunk / NumChunks;
+					const size_t chunkEnd = totalIters * (chunk + 1) / NumChunks;
+					const size_t chunkSize = chunkEnd - chunkBegin;
+
+					{
+						std::lock_guard lock { stdout_mutex };
+						std::cout << "Started chunk " << chunk << " with " << chunkSize << " iterations of level " << level << std::endl;
+					}
+
+					initString(strBuf.data(), level, chunkBegin);
+					memcpy(strBuf.data() + level, Suffix.data(), Suffix.length());
+					size_t numIters;
+					for (uint64_t i = 0; i < chunkSize && !stop_token.stop_requested(); ++i) {
+						nextString(strBuf.data(), level);
+						match(std::string_view(strBuf.data(), level + Suffix.length()));
+					}
+
+					if (!stop_token.stop_requested()) {
+						std::lock_guard lock { stdout_mutex };
+						std::cout << "Finished chunk " << chunk << " with " << chunkSize << " iterations of level " << level << std::endl;
+					}
+				});
+			}
 		}
 	}
 
