@@ -1,4 +1,6 @@
 #include <array>
+#include <cmath>
+#include <condition_variable>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -125,14 +127,53 @@ std::mutex stdout_mutex;
 void match(std::string_view str)
 {
 	if (Hash1(str) == CRACK1 && Hash2(str) == CRACK2) {
-		std::cout << "Found match: " << str << std::endl;
-		save(str);
 		stop_source.request_stop();
+		std::lock_guard lock { stdout_mutex };
+		std::cout << "\nFound match: " << str << std::endl;
+		save(str);
 	}
+}
+
+std::jthread startProgressThread(
+    bool display_statuses,
+    const std::vector<unsigned> &progresses, const std::vector<std::string> &statuses,
+    std::condition_variable &cv, std::mutex &cv_mutex, std::stop_source &progress_stop)
+{
+	return std::jthread([display_statuses, &cv, &cv_mutex, &statuses, &progresses, stop_token = stop_source.get_token(), progress_stop_token = progress_stop.get_token()]() {
+		while (!(stop_token.stop_requested() || progress_stop_token.stop_requested())) {
+			std::unique_lock lock { cv_mutex };
+			cv.wait(lock);
+			if (stop_token.stop_requested())
+				return;
+			std::lock_guard stdout_lock { stdout_mutex };
+			std::cout << "\33[2K\r "; // clear line
+			unsigned progressSum = 0;
+			for (unsigned progress : progresses)
+				progressSum += progress;
+			std::cout << (progressSum / progresses.size()) << "%";
+			if (display_statuses) {
+				for (const std::string &status : statuses) {
+					std::cout << " " << status;
+				}
+			}
+			std::cout.flush();
+		}
+	});
 }
 
 int main(int argc, char *argv[])
 {
+	bool progress = false;
+	bool display_statuses = false;
+	for (int i = 1; i < argc; ++i) {
+		std::string_view arg = argv[i];
+		if (arg == "-p") {
+			progress = true;
+		} else if (arg == "-s") {
+			display_statuses = true;
+		}
+	}
+
 	for (size_t i = 1; i < letters.size(); ++i) {
 		nextLetter[static_cast<unsigned char>(letters[i - 1])] = letters[i];
 	}
@@ -144,36 +185,86 @@ int main(int argc, char *argv[])
 	constexpr unsigned MinLevel = 1;
 	constexpr unsigned MaxLevel = 8;
 	constexpr unsigned NumChunks = 32;
+
+	std::condition_variable progress_cv;
+	std::mutex progress_cv_mutex;
+	std::vector<std::string> statuses(NumChunks);
+	std::vector<unsigned> progresses(NumChunks);
+	for (std::string &status : statuses) {
+		status.reserve(40);
+	}
+
 	uint64_t totalIters = 1;
 	std::cout << "Trying levels from " << MinLevel << " to " << MaxLevel << " in " << NumChunks << " chunks...\n";
-	for (unsigned level = MinLevel; level <= MaxLevel; level++) {
+	const std::stop_token loop_stop_token = stop_source.get_token();
+	for (unsigned level = MinLevel; level <= MaxLevel && !loop_stop_token.stop_requested(); level++) {
 		totalIters *= letters.size();
-		std::cout << "Level " << level << " with ~" << (totalIters / NumChunks) << " iterations per chunk.\n";
-		std::vector<std::jthread> threads;
-		for (unsigned chunk = 0; chunk < NumChunks; ++chunk) {
-			threads.emplace_back([totalIters, level, chunk, stop_token = stop_source.get_token()]() {
-				constexpr std::string_view Suffix = ".DUN";
-				std::array<char, 16> strBuf;
-
-				const size_t chunkBegin = totalIters * chunk / NumChunks;
-				const size_t chunkEnd = totalIters * (chunk + 1) / NumChunks;
-				const size_t chunkSize = chunkEnd - chunkBegin;
-
-				initString(strBuf.data(), level, chunkBegin);
-				memcpy(strBuf.data() + level, Suffix.data(), Suffix.length());
-				size_t numIters;
-				for (uint64_t i = 0; i < chunkSize && !stop_token.stop_requested(); ++i) {
-					nextString(strBuf.data(), level);
-					match(std::string_view(strBuf.data(), level + Suffix.length()));
+		std::cout << "Level " << level << " with ~" << (totalIters / NumChunks) << " iterations per chunk:\n";
+		{
+			std::stop_source progress_stop;
+			std::jthread progress_thread;
+			if (progress)
+				progress_thread = startProgressThread(display_statuses, progresses, statuses, progress_cv, progress_cv_mutex, progress_stop);
+			{
+				if (display_statuses) {
+					for (std::string &status : statuses) {
+						status.clear();
+						status.append("Start");
+					}
 				}
+				progress_cv.notify_one();
+				std::vector<std::jthread> threads;
+				for (unsigned chunk = 0; chunk < NumChunks; ++chunk) {
+					std::string &status = statuses[chunk];
+					unsigned &progress = progresses[chunk];
+					threads.emplace_back([display_statuses, totalIters, level, chunk, &progress, &status, &progress_cv, stop_token = stop_source.get_token()]() {
+						constexpr std::string_view Suffix = ".DUN";
+						std::array<char, 16> strBuf;
+						const size_t chunkBegin = totalIters * chunk / NumChunks;
+						const size_t chunkEnd = totalIters * (chunk + 1) / NumChunks;
+						const size_t chunkSize = chunkEnd - chunkBegin;
 
-				if (!stop_token.stop_requested()) {
-					std::lock_guard lock { stdout_mutex };
-					std::cout << "Finished chunk " << chunk << " with " << chunkSize << " iterations of level " << level << std::endl;
+						initString(strBuf.data(), level, chunkBegin);
+						memcpy(strBuf.data() + level, Suffix.data(), Suffix.length());
+						size_t numIters;
+						for (uint64_t i = 0; i < chunkSize && !stop_token.stop_requested(); ++i) {
+							nextString(strBuf.data(), level);
+							const std::string_view str { strBuf.data(), level + Suffix.length() };
+							match(str);
+							if (i % 1000193 == 0) {
+								{
+									std::lock_guard lock { stdout_mutex };
+									if (display_statuses) {
+										status.clear();
+										status.append(strBuf.data(), level);
+									}
+									progress = static_cast<unsigned>(std::llround(100 * static_cast<double>(i + 1) / chunkSize));
+								}
+								progress_cv.notify_one();
+							}
+						}
+
+						if (!stop_token.stop_requested()) {
+							{
+								std::lock_guard lock { stdout_mutex };
+								progress = 100;
+								if (display_statuses) {
+									status.clear();
+									status.append(std::string(level, ' '));
+								}
+							}
+							progress_cv.notify_one();
+						}
+					});
 				}
-			});
+			}
+			progress_stop.request_stop();
+			progress_cv.notify_one();
 		}
+		if (progress && !loop_stop_token.stop_requested())
+			std::cout << "\n";
 	}
+	stop_source.request_stop();
 
 	return 0;
 }
