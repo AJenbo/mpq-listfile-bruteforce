@@ -141,43 +141,37 @@ int main(int argc, char *argv[])
 	HashPrefix(prefix, 1);
 	HashPrefix(prefix, 2);
 
-	{
+	constexpr unsigned MinLevel = 1;
+	constexpr unsigned MaxLevel = 8;
+	constexpr unsigned NumChunks = 32;
+	uint64_t totalIters = 1;
+	std::cout << "Trying levels from " << MinLevel << " to " << MaxLevel << " in " << NumChunks << " chunks...\n";
+	for (unsigned level = MinLevel; level <= MaxLevel; level++) {
+		totalIters *= letters.size();
+		std::cout << "Level " << level << " with ~" << (totalIters / NumChunks) << " iterations per chunk.\n";
 		std::vector<std::jthread> threads;
-		constexpr unsigned MinLevel = 1;
-		constexpr unsigned MaxLevel = 8;
-		constexpr unsigned NumChunks = 8;
-		std::cout << "Trying levels from " << MinLevel << " to " << MaxLevel << " in " << NumChunks << "chunks...\n";
-		uint64_t totalIters = 1;
-		for (unsigned level = MinLevel; level <= MaxLevel; level++) {
-			totalIters *= letters.size();
-			for (unsigned chunk = 0; chunk < NumChunks; ++chunk) {
-				threads.emplace_back([totalIters, level, chunk, stop_token = stop_source.get_token()]() {
-					constexpr std::string_view Suffix = ".DUN";
-					std::array<char, 16> strBuf;
+		for (unsigned chunk = 0; chunk < NumChunks; ++chunk) {
+			threads.emplace_back([totalIters, level, chunk, stop_token = stop_source.get_token()]() {
+				constexpr std::string_view Suffix = ".DUN";
+				std::array<char, 16> strBuf;
 
-					const size_t chunkBegin = totalIters * chunk / NumChunks;
-					const size_t chunkEnd = totalIters * (chunk + 1) / NumChunks;
-					const size_t chunkSize = chunkEnd - chunkBegin;
+				const size_t chunkBegin = totalIters * chunk / NumChunks;
+				const size_t chunkEnd = totalIters * (chunk + 1) / NumChunks;
+				const size_t chunkSize = chunkEnd - chunkBegin;
 
-					{
-						std::lock_guard lock { stdout_mutex };
-						std::cout << "Started chunk " << chunk << " with " << chunkSize << " iterations of level " << level << std::endl;
-					}
+				initString(strBuf.data(), level, chunkBegin);
+				memcpy(strBuf.data() + level, Suffix.data(), Suffix.length());
+				size_t numIters;
+				for (uint64_t i = 0; i < chunkSize && !stop_token.stop_requested(); ++i) {
+					nextString(strBuf.data(), level);
+					match(std::string_view(strBuf.data(), level + Suffix.length()));
+				}
 
-					initString(strBuf.data(), level, chunkBegin);
-					memcpy(strBuf.data() + level, Suffix.data(), Suffix.length());
-					size_t numIters;
-					for (uint64_t i = 0; i < chunkSize && !stop_token.stop_requested(); ++i) {
-						nextString(strBuf.data(), level);
-						match(std::string_view(strBuf.data(), level + Suffix.length()));
-					}
-
-					if (!stop_token.stop_requested()) {
-						std::lock_guard lock { stdout_mutex };
-						std::cout << "Finished chunk " << chunk << " with " << chunkSize << " iterations of level " << level << std::endl;
-					}
-				});
-			}
+				if (!stop_token.stop_requested()) {
+					std::lock_guard lock { stdout_mutex };
+					std::cout << "Finished chunk " << chunk << " with " << chunkSize << " iterations of level " << level << std::endl;
+				}
+			});
 		}
 	}
 
