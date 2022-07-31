@@ -1,7 +1,12 @@
 #include <array>
+#include <cstring>
 #include <fstream>
 #include <iostream>
+#include <stop_token>
 #include <string>
+#include <string_view>
+#include <thread>
+#include <vector>
 
 constexpr std::array<std::array<uint32_t, 256>, 5> hashsource = []() {
 	uint32_t seed = 0x00100001;
@@ -77,7 +82,14 @@ constexpr uint32_t CRACK2 = 0x22575C4A;
 //constexpr uint32_t CRACK1 = 0x3CC2BEC6;
 //constexpr uint32_t CRACK2 = 0xC2F426EA;
 
-constexpr char letters[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ_-0123456789."; // todo take as arg
+// Sorted, contiguous up to Z (90), underscore is 95.
+// todo take as arg
+std::array<char, 39> letters {
+	'-', '.', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B',
+	'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P',
+	'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '_'
+};
+std::array<char, 256> nextLetter;
 
 void save(std::string_view result)
 {
@@ -87,39 +99,55 @@ void save(std::string_view result)
 	myfile.close();
 }
 
-std::string generatedName;
-int maxLevel = 0;
-
-void buildString(int pos = 0)
+bool nextString(char *str, size_t len)
 {
-	if (maxLevel == pos) {
-		if (Hash1(generatedName) == CRACK1 && Hash2(generatedName) == CRACK2) {
-			std::cout << "Found match: " << generatedName << std::endl;
-			save(generatedName);
-			exit(0);
+	for (size_t i = 0; i < len; ++i) {
+		if (str[i] != letters.back()) {
+			memset(str, letters.front(), i);
+			str[i] = nextLetter[static_cast<unsigned char>(str[i])];
+			return true;
 		}
-		return;
 	}
+	return false;
+}
 
-	for (int i = 0; i < sizeof(letters) - 1; i++) {
-		generatedName[pos] = letters[i];
-		buildString(pos + 1);
+std::stop_source stop_source;
+
+void match(std::string_view str)
+{
+	if (Hash1(str) == CRACK1 && Hash2(str) == CRACK2) {
+		std::cout << "Found match: " << str << std::endl;
+		save(str);
+		stop_source.request_stop();
 	}
 }
 
 int main(int argc, char *argv[])
 {
+	for (size_t i = 1; i < letters.size(); ++i) {
+		nextLetter[static_cast<unsigned char>(letters[i - 1])] = letters[i];
+	}
+
 	std::string prefix = "LEVELS\\L1DATA\\"; // TODO take as arg
 	HashPrefix(prefix, 1);
 	HashPrefix(prefix, 2);
 
-	for (unsigned level = 0; level < 8; level++) {
-		std::cout << "Trying " << (level + 1) << " levels...\n";
-		generatedName = std::string(level + 1, letters[0]);
-		generatedName.append(".DUN");
-		maxLevel = level + 1;
-
-		buildString();
+	{
+		std::vector<std::jthread> threads;
+		constexpr unsigned MinLevel = 1;
+		constexpr unsigned MaxLevel = 8;
+		std::cout << "Trying levels from " << MinLevel << " to " << MaxLevel << "...\n";
+		for (unsigned level = MinLevel; level <= MaxLevel; level++) {
+			threads.emplace_back([level, stop_token = stop_source.get_token()]() {
+				constexpr std::string_view Suffix = ".DUN";
+				std::array<char, 16> strBuf;
+				memset(strBuf.data(), letters.front(), level);
+				memcpy(strBuf.data() + level, Suffix.data(), Suffix.length());
+				while (!stop_token.stop_requested() && nextString(strBuf.data(), level)) {
+					match(std::string_view(strBuf.data(), level + Suffix.length()));
+				}
+			});
+		}
 	}
 
 	return 0;
