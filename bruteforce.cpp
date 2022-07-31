@@ -102,8 +102,8 @@ void save(std::string_view result)
 
 void initString(char *str, size_t len, uint64_t iter)
 {
-	for (size_t i = len; i > 0; --i) {
-		str[i - 1] = letters[iter % letters.size()];
+	for (size_t i = 0; i < len; ++i) {
+		str[i] = letters[iter % letters.size()];
 		iter /= letters.size();
 	}
 }
